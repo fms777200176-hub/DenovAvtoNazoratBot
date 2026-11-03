@@ -6,6 +6,7 @@ from html import escape
 
 from telegram import (
     Update,
+    ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -13,22 +14,15 @@ from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
-    ChatMemberHandler,
     CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-# ==============================
+# =====================================
 # SOZLAMALAR
-# ==============================
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("DenovAvtoNazorat")
+# =====================================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
@@ -48,72 +42,103 @@ GROUP_ID = int(
 
 NOTICE_COOLDOWN = 60
 
-ACTIVE_STATUSES = {
-    "member",
-    "administrator",
-    "creator",
-}
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+log = logging.getLogger("DenovAvtoNazorat")
 
 
-# ==============================
-# FOYDALANUVCHI ISMI
-# ==============================
-
-def get_user_name(user):
-    if user.username:
-        return "@" + escape(user.username)
-
-    return escape(user.first_name)
-
-
-# ==============================
-# KANAL OBUNASINI TEKSHIRISH
-# ==============================
+# =====================================
+# OBUNANI TEKSHIRISH
+# =====================================
 
 async def is_subscribed(context, user_id):
     try:
         member = await context.bot.get_chat_member(
-            CHANNEL_ID,
-            user_id
+            chat_id=CHANNEL_ID,
+            user_id=user_id,
         )
 
-        return member.status in ACTIVE_STATUSES
+        return member.status in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            "creator",
+        )
 
     except TelegramError:
         log.exception("Kanal obunasini tekshirishda xato")
         return None
 
 
-# ==============================
-# OBUNA BO'LISH XABARI
-# ==============================
+# =====================================
+# ESKI CHEKLOVNI OCHISH
+# FAQAT OBUNA TASDIQLANGANDA ISHLAYDI
+# =====================================
+
+async def allow_user(context, user_id):
+    permissions = ChatPermissions(
+        can_send_messages=True,
+        can_send_audios=True,
+        can_send_documents=True,
+        can_send_photos=True,
+        can_send_videos=True,
+        can_send_video_notes=True,
+        can_send_voice_notes=True,
+        can_send_polls=True,
+        can_send_other_messages=True,
+        can_add_web_page_previews=True,
+    )
+
+    await context.bot.restrict_chat_member(
+        chat_id=GROUP_ID,
+        user_id=user_id,
+        permissions=permissions,
+    )
+
+
+# =====================================
+# FOYDALANUVCHI NIKNAME
+# =====================================
+
+def user_name(user):
+    if user.username:
+        return "@" + escape(user.username)
+
+    return escape(user.first_name)
+
+
+# =====================================
+# OBUNA XABARINI YUBORISH
+# =====================================
 
 async def send_subscription_notice(context, user):
-    now = time.monotonic()
 
     notices = context.application.bot_data.setdefault(
         "last_notice", {}
     )
 
-    # 60 soniyada bir martadan ortiq yubormaslik
+    now = time.monotonic()
+
     if now - notices.get(user.id, 0) < NOTICE_COOLDOWN:
         return
 
-    name = get_user_name(user)
+    name = user_name(user)
 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "📢 DENOV AVTO SAVDO KANALI",
-                url=CHANNEL_URL
+                "📢 DENOV AVTO SAVDO",
+                url=CHANNEL_URL,
             )
         ],
         [
             InlineKeyboardButton(
                 "✅ OBUNANI TASDIQLASH",
-                callback_data=f"verify:{user.id}"
+                callback_data=f"verify:{user.id}",
             )
-        ]
+        ],
     ])
 
     text = (
@@ -133,7 +158,7 @@ async def send_subscription_notice(context, user):
             text=text,
             parse_mode="HTML",
             reply_markup=keyboard,
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
         )
 
         notices[user.id] = now
@@ -142,11 +167,12 @@ async def send_subscription_notice(context, user):
         log.exception("Obuna xabarini yuborishda xato")
 
 
-# ==============================
-# OBUNANI TASDIQLASH TUGMASI
-# ==============================
+# =====================================
+# OBUNANI TASDIQLASH
+# =====================================
 
 async def verify_subscription(update, context):
+
     query = update.callback_query
 
     if not query:
@@ -157,40 +183,58 @@ async def verify_subscription(update, context):
     except (ValueError, IndexError):
         await query.answer(
             "Tugma xato.",
-            show_alert=True
+            show_alert=True,
         )
         return
 
     # Tugmani faqat o'z egasi bosishi mumkin
     if query.from_user.id != target_id:
         await query.answer(
-            "Bu tugma boshqa foydalanuvchi uchun.",
-            show_alert=True
+            "Bu tugma siz uchun emas.",
+            show_alert=True,
         )
         return
 
     subscribed = await is_subscribed(
         context,
-        query.from_user.id
+        query.from_user.id,
     )
 
     if subscribed is None:
         await query.answer(
             "Obunani tekshirishda xatolik. "
-            "Birozdan so‘ng qayta urinib ko‘ring.",
-            show_alert=True
+            "Keyinroq qayta urinib ko‘ring.",
+            show_alert=True,
         )
         return
 
     if not subscribed:
         await query.answer(
-            "❌ Siz hali kanalga obuna bo‘lmagansiz!\n\n"
-            "Avval Denov Avto Savdo kanaliga obuna bo‘ling.",
-            show_alert=True
+            "❌ Siz hali kanalga obuna bo‘lmagansiz. "
+            "Avval kanalga obuna bo‘ling!",
+            show_alert=True,
         )
         return
 
-    # Faqat tugmani bosgan odamga ko'rinadigan xabar
+    # Obuna bo'lgan foydalanuvchining eski cheklovini ochish
+    try:
+        await allow_user(
+            context,
+            query.from_user.id,
+        )
+
+    except TelegramError:
+        log.exception("Yozish huquqini ochishda xato")
+
+        await query.answer(
+            "Obuna tasdiqlandi, lekin guruhdagi "
+            "cheklovni ochib bo‘lmadi. "
+            "Admin bilan bog‘laning.",
+            show_alert=True,
+        )
+        return
+
+    # Minnatdorchilik faqat foydalanuvchining o'ziga ko'rinadi
     if query.from_user.username:
         display_name = "@" + query.from_user.username
     else:
@@ -205,29 +249,28 @@ async def verify_subscription(update, context):
 
     await query.answer(
         thank_you,
-        show_alert=True
+        show_alert=True,
     )
 
-    # Tasdiqlangan tugmali xabarni guruhdan olib tashlash
+    # Tasdiqlangan eski tugmali xabarni o'chirish
     if query.message:
         try:
             await query.message.delete()
         except TelegramError:
-            log.warning(
-                "Tasdiqlash xabarini o'chirib bo'lmadi"
-            )
+            log.warning("Tugmali xabarni o'chirib bo'lmadi")
 
     log.info(
         "Obuna tasdiqlandi: %s",
-        query.from_user.id
+        query.from_user.id,
     )
 
 
-# ==============================
-# GURUH XABARLARINI NAZORAT QILISH
-# ==============================
+# =====================================
+# GURUH XABARLARINI TEKSHIRISH
+# =====================================
 
 async def moderate_group_message(update, context):
+
     message = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
@@ -241,20 +284,24 @@ async def moderate_group_message(update, context):
     if user.is_bot:
         return
 
+    # Xizmat xabarlarini bu yerda tekshirmaymiz
+    if message.new_chat_members or message.left_chat_member:
+        return
+
     # Anonim admin xabarlariga tegmaymiz
     if message.sender_chat:
         return
 
-    # Adminlar va guruh egalariga tegmaymiz
+    # Guruh adminlariga tegmaymiz
     try:
         member = await context.bot.get_chat_member(
-            GROUP_ID,
-            user.id
+            chat_id=GROUP_ID,
+            user_id=user.id,
         )
 
         if member.status in (
             ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
+            "creator",
         ):
             return
 
@@ -264,10 +311,10 @@ async def moderate_group_message(update, context):
 
     subscribed = await is_subscribed(
         context,
-        user.id
+        user.id,
     )
 
-    # Tekshirishda texnik xato bo'lsa, xabarni o'chirmaymiz
+    # Texnik xatoda foydalanuvchining xabarini o'chirmaymiz
     if subscribed is None:
         return
 
@@ -279,17 +326,21 @@ async def moderate_group_message(update, context):
     try:
         await message.delete()
     except TelegramError:
-        log.exception("Xabarni o'chirishda xato")
+        log.exception("Foydalanuvchi xabarini o'chirishda xato")
 
-    # Kanalga obuna bo'lish tugmalarini yuboramiz
-    await send_subscription_notice(context, user)
+    # Obuna tugmalarini yuboramiz
+    await send_subscription_notice(
+        context,
+        user,
+    )
 
 
-# ==============================
-# YANGI A'ZO XIZMAT XABARLARI
-# ==============================
+# =====================================
+# YANGI A'ZO XIZMAT XABARLARINI O'CHIRISH
+# =====================================
 
 async def clean_service_messages(update, context):
+
     message = update.effective_message
     chat = update.effective_chat
 
@@ -299,69 +350,24 @@ async def clean_service_messages(update, context):
     if chat.id != GROUP_ID:
         return
 
+    if not (
+        message.new_chat_members
+        or message.left_chat_member
+    ):
+        return
+
     try:
         await message.delete()
     except TelegramError:
         log.exception("Xizmat xabarini o'chirishda xato")
 
 
-# ==============================
-# KANAL OBUNASI O'ZGARISHI
-# ==============================
-
-async def channel_membership_changed(update, context):
-    change = update.chat_member
-
-    if not change:
-        return
-
-    channel_id = context.application.bot_data.get(
-        "channel_id"
-    )
-
-    if channel_id is None:
-        return
-
-    if change.chat.id != channel_id:
-        return
-
-    user = change.new_chat_member.user
-
-    if user.is_bot:
-        return
-
-    old_status = change.old_chat_member.status
-    new_status = change.new_chat_member.status
-
-    was_subscribed = old_status in ACTIVE_STATUSES
-    now_subscribed = new_status in ACTIVE_STATUSES
-
-    if was_subscribed == now_subscribed:
-        return
-
-    if now_subscribed:
-        log.info(
-            "Kanalga obuna bo'ldi: %s",
-            user.id
-        )
-
-    else:
-        log.info(
-            "Kanal obunasidan chiqdi: %s",
-            user.id
-        )
-
-    # DIQQAT:
-    # Hech kimning guruhda yozish huquqini
-    # cheklamaymiz yoki o'zgartirmaymiz.
-    # Keyingi yuborgan xabarida obunasi tekshiriladi.
-
-
-# ==============================
-# BOT ISHGA TUSHISHI
-# ==============================
+# =====================================
+# BOTNI ISHGA TUSHIRISH
+# =====================================
 
 async def post_init(application):
+
     try:
         channel = await application.bot.get_chat(
             CHANNEL_ID
@@ -371,16 +377,14 @@ async def post_init(application):
 
         log.info(
             "Kanal ulandi: %s",
-            channel.title
+            channel.title,
         )
 
     except TelegramError:
-        log.exception("Kanalga ulanishda xato")
+        log.exception(
+            "Kanalga ulanishda xato. CHANNEL_ID ni tekshiring."
+        )
 
-
-# ==============================
-# ASOSIY FUNKSIYA
-# ==============================
 
 def main():
 
@@ -391,43 +395,30 @@ def main():
         .build()
     )
 
-    # Kanal obunasi o'zgarishini kuzatish
-    app.add_handler(
-        ChatMemberHandler(
-            channel_membership_changed,
-            ChatMemberHandler.CHAT_MEMBER
-        )
-    )
-
-    # Obunani tasdiqlash tugmasi
+    # Tasdiqlash tugmasi
     app.add_handler(
         CallbackQueryHandler(
             verify_subscription,
-            pattern=r"^verify:\d+$"
+            pattern=r"^verify:\d+$",
         )
     )
 
-    # Yangi a'zo va chiqish xabarlarini tozalash
+    # Yangi a'zo va chiqish xizmat xabarlari
     app.add_handler(
         MessageHandler(
-            filters.ChatType.GROUPS
-            & (
-                filters.StatusUpdate.NEW_CHAT_MEMBERS
-                | filters.StatusUpdate.LEFT_CHAT_MEMBER
-            ),
-            clean_service_messages
+            filters.ChatType.GROUPS,
+            clean_service_messages,
         ),
-        group=0
+        group=0,
     )
 
-    # Guruhdagi xabarlarni tekshirish
+    # Guruhdagi oddiy xabarlarni tekshirish
     app.add_handler(
         MessageHandler(
-            filters.ChatType.GROUPS
-            & ~filters.StatusUpdate.ALL,
-            moderate_group_message
+            filters.ChatType.GROUPS,
+            moderate_group_message,
         ),
-        group=1
+        group=1,
     )
 
     log.info("Denov Avto Nazorat Bot ishga tushdi!")
@@ -435,11 +426,9 @@ def main():
     app.run_polling(
         allowed_updates=[
             "message",
-            "chat_member",
             "callback_query",
-            "my_chat_member"
         ],
-        drop_pending_updates=True
+        drop_pending_updates=True,
     )
 
 
