@@ -3,7 +3,7 @@ import os
 import time
 
 from telegram import ChatPermissions, Update
-from telegram.constants import ChatMemberStatus, ChatType
+from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -45,26 +45,19 @@ ALLOW_PERMISSIONS = ChatPermissions(
     can_add_web_page_previews=True,
 )
 
-
-# Bir foydalanuvchiga obuna eslatmasini ko‘pi bilan 60 soniyada bir yuboradi.
 NOTICE_COOLDOWN_SECONDS = 60
 
 
-async def is_subscribed(
-    context: ContextTypes.DEFAULT_TYPE, user_id: int
-) -> bool:
-    """Kanal obunasini tekshiradi. Tekshirish xato bo‘lsa, ruxsat bermaydi."""
+async def is_subscribed(context, user_id):
     try:
         member = await context.bot.get_chat_member(CHANNEL_ID, user_id)
         return member.status in ACTIVE_STATUSES
     except TelegramError:
-        log.exception("Kanal obunasini tekshirishda xato (user_id=%s)", user_id)
+        log.exception("Obunani tekshirishda xato")
         return False
 
 
-async def allow_user(
-    context: ContextTypes.DEFAULT_TYPE, user_id: int
-) -> None:
+async def allow_user(context, user_id):
     await context.bot.restrict_chat_member(
         chat_id=GROUP_ID,
         user_id=user_id,
@@ -72,12 +65,12 @@ async def allow_user(
     )
 
 
-async def notify_to_subscribe(
-    context: ContextTypes.DEFAULT_TYPE, user_id: int
-) -> None:
-    """Guruhdagi obuna eslatmalarini takror-takror yubormaslik uchun cheklaydi."""
+async def notify_to_subscribe(context, user_id):
     now = time.monotonic()
-    last_sent = context.application.bot_data.setdefault("last_notice", {})
+    last_sent = context.application.bot_data.setdefault(
+        "last_notice", {}
+    )
+
     if now - last_sent.get(user_id, 0) < NOTICE_COOLDOWN_SECONDS:
         return
 
@@ -85,114 +78,136 @@ async def notify_to_subscribe(
         await context.bot.send_message(
             chat_id=GROUP_ID,
             text=(
-                f'<a href="tg://user?id={user_id}">Siz</a>, guruhda yozish uchun avval '
-                f'<a href="{CHANNEL_URL}">Denov Avto Savdo kanaliga obuna bo‘ling</a>.\n'
-                "Obuna bo‘lgach, bemalol yozishingiz mumkin."
+                f'<a href="tg://user?id={user_id}">'
+                'Hurmatli foydalanuvchi</a>,\n\n'
+                '📢 Guruhda yozish uchun avval '
+                f'<a href="{CHANNEL_URL}">Denov Avto Savdo</a> '
+                'kanaliga obuna bo‘ling.\n\n'
+                '✅ Obuna bo‘lgach, guruhda bemalol '
+                'yozishingiz mumkin.'
             ),
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
         last_sent[user_id] = now
+
     except TelegramError:
-        log.exception("Obuna eslatmasini yuborib bo‘lmadi (user_id=%s)", user_id)
+        log.exception("Eslatma yuborilmadi")
 
 
-async def clean_service_messages(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def clean_service_messages(update, context):
     message = update.effective_message
     chat = update.effective_chat
+
     if not message or not chat or chat.id != GROUP_ID:
         return
 
-    # Telegramning avtomatik qo‘shildi/chiqdi xizmat xabarini o‘chiradi.
     try:
         await message.delete()
     except TelegramError:
-        log.exception("Xizmat xabarini o‘chirib bo‘lmadi")
+        log.exception("Xizmat xabarini o‘chirishda xato")
 
     for member in message.new_chat_members or []:
         if member.is_bot:
             continue
-        # Yangi a'zoning yozish klaviaturasini ochiq qoldiramiz.
-        # Obunasiz a'zo yozishga uringanda xabari o'chirilib, eslatma yuboriladi.
+
         if await is_subscribed(context, member.id):
             try:
                 await allow_user(context, member.id)
             except TelegramError:
-                log.exception("Obunali yangi a'zoga ruxsat berilmadi")
+                log.exception("Ruxsat berishda xato")
 
 
-async def moderate_group_message(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def moderate_group_message(update, context):
     message = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
 
-    if not message or not user or not chat or chat.id != GROUP_ID:
+    if not message or not user or not chat:
         return
-    if user.is_bot:
+
+    if chat.id != GROUP_ID or user.is_bot:
         return
 
     if await is_subscribed(context, user.id):
         return
 
-    # Klaviatura ochiq qoladi: xabar o'chiriladi, lekin yozish huquqi olinmaydi.
     try:
         await message.delete()
     except TelegramError:
-        log.exception("Obunasiz foydalanuvchi xabarini o'chirib bo'lmadi")
+        log.exception("Xabarni o‘chirishda xato")
 
     await notify_to_subscribe(context, user.id)
 
 
-async def post_init(application: Application) -> None:
-    """Kanal ID sini aniqlaydi va logga yozadi."""
+async def post_init(application):
     try:
         channel = await application.bot.get_chat(CHANNEL_ID)
         application.bot_data["channel_id"] = channel.id
-        log.info("Kanal ulandi: %s (%s)", channel.title, channel.id)
+        log.info("Kanal ulandi: %s", channel.title)
     except TelegramError:
-        log.exception(
-            "Kanalga ulanib bo‘lmadi. Kanal manzili va bot adminligini tekshiring."
-        )
+        log.exception("Kanalga ulanishda xato")
 
 
-async def channel_membership_changed(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def channel_membership_changed(update, context):
     change = update.chat_member
+
     if not change:
         return
 
     expected_channel_id = context.application.bot_data.get("channel_id")
-    if expected_channel_id is None or change.chat.id != expected_channel_id:
+
+    if expected_channel_id is None:
+        return
+
+    if change.chat.id != expected_channel_id:
         return
 
     user = change.new_chat_member.user
+
     if user.is_bot:
         return
 
-    was_subscribed = change.old_chat_member.status in ACTIVE_STATUSES
-    now_subscribed = change.new_chat_member.status in ACTIVE_STATUSES
+    was_subscribed = (
+        change.old_chat_member.status in ACTIVE_STATUSES
+    )
+    now_subscribed = (
+        change.new_chat_member.status in ACTIVE_STATUSES
+    )
+
     if now_subscribed == was_subscribed:
         return
 
-    try:
-        if now_subscribed:
-            # Oldingi versiya cheklagan bo'lsa, obuna bo'lganda ruxsatni tiklaymiz.
+    if now_subscribed:
+        try:
             await allow_user(context, user.id)
-            log.info("Obuna tasdiqlandi; guruhda yozish ruxsati tiklandi.")
-        else:
-            # Obunadan chiqsa ham yozish klaviaturasi yopilmaydi.
-            log.info("Foydalanuvchi obunadan chiqdi; xabarlar moderatsiya qilinadi.")
-    except TelegramError:
-        log.exception("Kanal obunasi o'zgarganda guruh ruxsatini yangilashda xato")
+
+            await context.bot.send_message(
+                chat_id=GROUP_ID,
+                text=(
+                    f'🎉 <a href="tg://user?id={user.id}">'
+                    'Hurmatli foydalanuvchi</a>,\n\n'
+                    'Denov Avto Savdo kanaliga obuna '
+                    'bo‘lganingiz uchun minnatdormiz!\n\n'
+                    '✅ Endi guruhda bemalol yozishingiz mumkin.'
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+            log.info("Foydalanuvchi obuna bo‘ldi: %s", user.id)
+
+        except TelegramError:
+            log.exception("Obuna tasdiqlashda xato")
 
 
-def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+def main():
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(
         ChatMemberHandler(
@@ -224,8 +239,13 @@ def main() -> None:
     )
 
     log.info("Denov Avto Nazorat Bot ishga tushmoqda...")
+
     app.run_polling(
-        allowed_updates=["message", "chat_member", "my_chat_member"],
+        allowed_updates=[
+            "message",
+            "chat_member",
+            "my_chat_member",
+        ],
         drop_pending_updates=True,
     )
 
