@@ -45,18 +45,6 @@ ALLOW_PERMISSIONS = ChatPermissions(
     can_add_web_page_previews=True,
 )
 
-RESTRICT_PERMISSIONS = ChatPermissions(
-    can_send_messages=False,
-    can_send_audios=False,
-    can_send_documents=False,
-    can_send_photos=False,
-    can_send_videos=False,
-    can_send_video_notes=False,
-    can_send_voice_notes=False,
-    can_send_polls=False,
-    can_send_other_messages=False,
-    can_add_web_page_previews=False,
-)
 
 # Bir foydalanuvchiga obuna eslatmasini ko‘pi bilan 60 soniyada bir yuboradi.
 NOTICE_COOLDOWN_SECONDS = 60
@@ -72,16 +60,6 @@ async def is_subscribed(
     except TelegramError:
         log.exception("Kanal obunasini tekshirishda xato (user_id=%s)", user_id)
         return False
-
-
-async def restrict_user(
-    context: ContextTypes.DEFAULT_TYPE, user_id: int
-) -> None:
-    await context.bot.restrict_chat_member(
-        chat_id=GROUP_ID,
-        user_id=user_id,
-        permissions=RESTRICT_PERMISSIONS,
-    )
 
 
 async def allow_user(
@@ -107,9 +85,9 @@ async def notify_to_subscribe(
         await context.bot.send_message(
             chat_id=GROUP_ID,
             text=(
-                "📢 Guruhda yozish uchun avval "
+                f'<a href="tg://user?id={user_id}">Siz</a>, guruhda yozish uchun avval '
                 f'<a href="{CHANNEL_URL}">Denov Avto Savdo kanaliga obuna bo‘ling</a>.\n'
-                "Obuna bo‘lgach, guruhga qaytib yozishingiz mumkin."
+                "Obuna bo‘lgach, bemalol yozishingiz mumkin."
             ),
             parse_mode="HTML",
             disable_web_page_preview=True,
@@ -136,19 +114,13 @@ async def clean_service_messages(
     for member in message.new_chat_members or []:
         if member.is_bot:
             continue
+        # Yangi a'zoning yozish klaviaturasini ochiq qoldiramiz.
+        # Obunasiz a'zo yozishga uringanda xabari o'chirilib, eslatma yuboriladi.
         if await is_subscribed(context, member.id):
-            # Kanalga obuna bo‘lgan yangi a’zoga ruxsat beriladi.
             try:
                 await allow_user(context, member.id)
             except TelegramError:
                 log.exception("Obunali yangi a'zoga ruxsat berilmadi")
-            continue
-
-        try:
-            await restrict_user(context, member.id)
-            await notify_to_subscribe(context, member.id)
-        except TelegramError:
-            log.exception("Obunasiz yangi a'zoni cheklashda xato")
 
 
 async def moderate_group_message(
@@ -166,17 +138,13 @@ async def moderate_group_message(
     if await is_subscribed(context, user.id):
         return
 
-    # Obunasiz foydalanuvchining xabarini o‘chiradi va yozishini cheklaydi.
+    # Klaviatura ochiq qoladi: xabar o'chiriladi, lekin yozish huquqi olinmaydi.
     try:
         await message.delete()
     except TelegramError:
-        log.exception("Obunasiz foydalanuvchi xabarini o‘chirib bo‘lmadi")
+        log.exception("Obunasiz foydalanuvchi xabarini o'chirib bo'lmadi")
 
-    try:
-        await restrict_user(context, user.id)
-        await notify_to_subscribe(context, user.id)
-    except TelegramError:
-        log.exception("Obunasiz foydalanuvchini cheklashda xato")
+    await notify_to_subscribe(context, user.id)
 
 
 async def post_init(application: Application) -> None:
@@ -208,23 +176,19 @@ async def channel_membership_changed(
 
     was_subscribed = change.old_chat_member.status in ACTIVE_STATUSES
     now_subscribed = change.new_chat_member.status in ACTIVE_STATUSES
-
-    # Faqat haqiqiy obuna holati almashganda guruhdagi ruxsatni o‘zgartiradi.
     if now_subscribed == was_subscribed:
         return
 
     try:
         if now_subscribed:
+            # Oldingi versiya cheklagan bo'lsa, obuna bo'lganda ruxsatni tiklaymiz.
             await allow_user(context, user.id)
-            # Ataylab guruhga “obuna tasdiqlandi” xabari yuborilmaydi:
-            # bu keraksiz takroriy xabarlarning oldini oladi.
-            log.info("Obuna tasdiqlandi; guruhga yozish ruxsati berildi.")
+            log.info("Obuna tasdiqlandi; guruhda yozish ruxsati tiklandi.")
         else:
-            await restrict_user(context, user.id)
-            await notify_to_subscribe(context, user.id)
-            log.info("Obunadan chiqdi; guruhda yozish cheklab qo‘yildi.")
+            # Obunadan chiqsa ham yozish klaviaturasi yopilmaydi.
+            log.info("Foydalanuvchi obunadan chiqdi; xabarlar moderatsiya qilinadi.")
     except TelegramError:
-        log.exception("Kanal obunasi o‘zgarganda guruh ruxsatini yangilashda xato")
+        log.exception("Kanal obunasi o'zgarganda guruh ruxsatini yangilashda xato")
 
 
 def main() -> None:
