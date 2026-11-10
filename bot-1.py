@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+import sqlite3
 
 from telegram import (
     Update,
@@ -32,6 +33,8 @@ GROUP_ID = int(os.getenv("GROUP_ID", "-1003945847242"))
 
 # Bir foydalanuvchiga takroriy obuna xabari yuborish oralig'i
 NOTICE_COOLDOWN = 30
+INVITE_TARGET = 3
+DB_PATH = os.getenv("DB_PATH", "denov_avto_nazorat.sqlite3")
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -95,6 +98,132 @@ def user_display_name(user) -> str:
     return escape(name)
 
 
+# ---------------- TAKLIFLAR HISOBI (DOIMIY SQLITE) ----------------
+
+def init_db() -> None:
+    """Taklif havolalari va amaldagi takliflarni restartdan keyin ham saqlaydi."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS invite_links (
+                user_id INTEGER PRIMARY KEY,
+                invite_link TEXT NOT NULL UNIQUE
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS invite_joins (
+                invited_user_id INTEGER PRIMARY KEY,
+                inviter_user_id INTEGER NOT NULL,
+                joined_at INTEGER NOT NULL
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_inviter ON invite_joins(inviter_user_id)")
+
+
+def get_invite_link(user_id: int):
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT invite_link FROM invite_links WHERE user_id=?", (user_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+
+def save_invite_link(user_id: int, link: str) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT OR REPLACE INTO invite_links(user_id, invite_link) VALUES(?, ?)",
+            (user_id, link),
+        )
+
+
+def invite_count(user_id: int) -> int:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT COUNT(*) FROM invite_joins WHERE inviter_user_id=?", (user_id,)
+        ).fetchone()
+        return int(row[0])
+
+
+def record_invite_join(inviter_id: int, invited_id: int) -> None:
+    if inviter_id == invited_id:
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        # Bitta odam bir vaqtda faqat bitta taklif qiluvchiga hisoblanadi.
+        con.execute(
+            "INSERT OR REPLACE INTO invite_joins(invited_user_id, inviter_user_id, joined_at) "
+            "VALUES(?, ?, ?)",
+            (invited_id, inviter_id, int(time.time())),
+        )
+
+
+def remove_invited_member(invited_id: int) -> None:
+    # Tanlangan qoida: taklif qilingan a'zo chiqsa, uning hissasi hisobdan ayriladi.
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM invite_joins WHERE invited_user_id=?", (invited_id,))
+
+
+async def ensure_personal_invite_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
+    link = get_invite_link(user_id)
+    if link:
+        return link
+    invite = await context.bot.create_chat_invite_link(
+        chat_id=GROUP_ID,
+        name=f"3-taklif-{user_id}",
+        creates_join_request=False,
+    )
+    save_invite_link(user_id, invite.invite_link)
+    return invite.invite_link
+
+
+async def send_invite_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    try:
+        link = await ensure_personal_invite_link(context, user.id)
+        count = invite_count(user.id)
+        await message.reply_text(
+            "👥 Guruhda yozish uchun 3 ta yangi odam taklif qiling.\n\n"
+            f"Sizning shaxsiy taklif havolangiz:\n{link}\n\n"
+            f"Hisoblangan a'zolar: {count}/{INVITE_TARGET}\n"
+            "Faqat shu havola orqali birinchi marta qo'shilgan yangi a'zolar hisoblanadi. "
+            "Taklif qilgan odamingiz guruhdan chiqsa, hisobdan ayriladi."
+        )
+    except TelegramError:
+        log.exception("Taklif havolasini yaratishda xato. user_id=%s", user.id)
+        await message.reply_text(
+            "❌ Taklif havolasi yaratilmadi. Bot guruhda administrator va "
+            "taklif havolalarini boshqarish huquqiga ega ekanini tekshiring."
+        )
+
+
+async def track_group_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    change = update.chat_member
+    if not change or change.chat.id != GROUP_ID:
+        return
+    member = change.new_chat_member.user
+    if member.is_bot:
+        return
+    old_status = change.old_chat_member.status
+    new_status = change.new_chat_member.status
+    active = ACTIVE_STATUSES
+    joined = old_status not in active and new_status in active
+    left = old_status in active and new_status not in active
+
+    if joined and change.invite_link:
+        link = change.invite_link.invite_link
+        with sqlite3.connect(DB_PATH) as con:
+            row = con.execute(
+                "SELECT user_id FROM invite_links WHERE invite_link=?", (link,)
+            ).fetchone()
+        if row:
+            record_invite_join(int(row[0]), member.id)
+            log.info("Taklif hisoblandi. inviter=%s invited=%s", row[0], member.id)
+    elif left:
+        remove_invited_member(member.id)
+        log.info("A'zo chiqdi, taklif hisobi ayrildi. user_id=%s", member.id)
+
+
 # ---------------- OBUNA TUGMALARI ----------------
 
 async def send_subscription_prompt(
@@ -136,10 +265,10 @@ async def send_subscription_prompt(
             chat_id=GROUP_ID,
             text=(
                 f"📣 <b>Hurmatli {mention}!</b>\n\n"
-                "Guruhda yozish uchun avval asosiy kanalimizga obuna bo‘ling.\n\n"
-                "Obuna bo‘lganingizdan so‘ng "
-                "«OBUNANI TASDIQLASH» tugmasini bosing.\n\n"
-                "<i>Tugmani bosib obunangizni tekshiring.</i>"
+                "Guruhda yozish uchun asosiy kanalga obuna bo‘ling va 3 ta yangi odam taklif qiling.\n\n"
+                "Taklif havolangizni olish uchun botga shaxsiy chatda /invite buyrug‘ini yuboring.\n"
+                "Obuna bo‘lgach, quyidagi tugma orqali tasdiqlang.\n\n"
+                "<i>3 ta taklif va kanal obunasi bajarilgandan keyin yozishingiz mumkin.</i>"
             ),
             parse_mode="HTML",
             reply_markup=keyboard,
@@ -175,20 +304,19 @@ async def check_subscription_button(
         return
 
     if await is_subscribed(context, target_user_id):
-        try:
-            await restore_group_permissions(context, target_user_id)
-        except TelegramError:
-            # Ruxsatni tiklashda xato bo'lsa ham, obuna tekshiruvi muvaffaqiyatli bo'lganini yashirmaymiz.
-            log.exception("Guruh ruxsatini tiklashda xato. user_id=%s", target_user_id)
-
-        name = user_display_name(query.from_user)
-        await query.answer(
-            f"🎉 Hurmatli {query.from_user.full_name}, "
-            "asosiy Denov Avto Savdo kanalimizga obuna bo‘lganingiz uchun minnatdormiz! "
-            "Endi guruhda bemalol yozishingiz mumkin.",
-            show_alert=True,
-        )
-        log.info("Obuna tasdiqlandi. user_id=%s name=%s", target_user_id, name)
+        count = invite_count(target_user_id)
+        if count >= INVITE_TARGET:
+            name = user_display_name(query.from_user)
+            await query.answer(
+                f"🎉 Hurmatli {query.from_user.full_name}, barcha shartlar bajarildi. Endi guruhda yozishingiz mumkin!",
+                show_alert=True,
+            )
+            log.info("Kirish talablari bajarildi. user_id=%s name=%s", target_user_id, name)
+        else:
+            await query.answer(
+                f"✅ Kanal obunasi tasdiqlandi. Yozish uchun yana {INVITE_TARGET-count} ta yangi odam taklif qiling. /invite buyrug‘i orqali havola oling.",
+                show_alert=True,
+            )
     else:
         await query.answer(
             "❌ Siz hali kanalga obuna bo‘lmagansiz. "
@@ -205,9 +333,16 @@ async def moderate_group_message(
 ) -> None:
     message = update.effective_message
     chat = update.effective_chat
-    user = update.effective_user
 
-    if not message or not chat or chat.id != GROUP_ID or not user:
+    if not message or not chat or chat.id != GROUP_ID:
+        return
+
+    # Kanal postining muhokama guruhiga avtomatik uzatilgan nusxasiga tegmaymiz.
+    if getattr(message, "is_automatic_forward", False):
+        return
+
+    user = update.effective_user
+    if not user:
         return
 
     if user.is_bot:
@@ -217,10 +352,12 @@ async def moderate_group_message(
     if message.text and message.text.startswith("/"):
         return
 
-    if await is_subscribed(context, user.id):
+    subscribed = await is_subscribed(context, user.id)
+    invited = invite_count(user.id)
+    if subscribed and invited >= INVITE_TARGET:
         return
 
-    # Obuna bo'lmagan odamning xabarini o'chiramiz.
+    # Talablardan biri bajarilmagan bo'lsa, oddiy foydalanuvchi xabarini o'chiramiz.
     try:
         await message.delete()
     except TelegramError:
@@ -230,8 +367,28 @@ async def moderate_group_message(
             user.id,
         )
 
-    # Yozish klaviaturasini yopmaymiz; har bir xabar yuborilganda obuna eslatiladi.
-    await send_subscription_prompt(context, user)
+    # Qaysi shart bajarilmaganini aniq ko'rsatamiz.
+    if not subscribed:
+        await send_subscription_prompt(context, user)
+    else:
+        now = time.monotonic()
+        last_notice = context.application.bot_data.setdefault("last_notice", {})
+        if now - last_notice.get(user.id, 0) >= NOTICE_COOLDOWN:
+            try:
+                link = await ensure_personal_invite_link(context, user.id)
+                await context.bot.send_message(
+                    chat_id=GROUP_ID,
+                    text=(
+                        f"👥 Guruhda yozish uchun yana {max(0, INVITE_TARGET - invited)} ta yangi odam taklif qiling.\n"
+                        f"Hisobingiz: {invited}/{INVITE_TARGET}\n"
+                        f"Shaxsiy taklif havolangiz: {link}\n"
+                        "Taklif qilgan odamingiz chiqib ketsa, hisobdan ayriladi."
+                    ),
+                    disable_web_page_preview=True,
+                )
+                last_notice[user.id] = now
+            except TelegramError:
+                log.exception("Taklif eslatmasini yuborishda xato. user_id=%s", user.id)
 
 
 async def clean_service_messages(
@@ -302,6 +459,7 @@ async def post_init(application: Application) -> None:
 
 
 def main() -> None:
+    init_db()
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -317,8 +475,18 @@ def main() -> None:
         )
     )
 
+    # Taklif havolasini olish uchun /invite.
+    from telegram.ext import CommandHandler
+    app.add_handler(CommandHandler("invite", send_invite_instructions))
+
     # Tugmani bosgan odamning obunasini tekshiradi.
     app.add_handler(CallbackQueryHandler(check_subscription_button, pattern=r"^check_sub:"))
+
+    # Guruhga kim taklif havolasi bilan kirganini va kim chiqib ketganini kuzatadi.
+    app.add_handler(
+        ChatMemberHandler(track_group_member, ChatMemberHandler.CHAT_MEMBER),
+        group=-1,
+    )
 
     # Yangi a'zo / chiqib ketgan a'zo xizmat xabarlarini tozalaydi.
     app.add_handler(
