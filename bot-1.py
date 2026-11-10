@@ -3,6 +3,7 @@ import logging
 import os
 import time
 import sqlite3
+from urllib.parse import quote
 
 from telegram import (
     Update,
@@ -175,21 +176,49 @@ async def ensure_personal_invite_link(context: ContextTypes.DEFAULT_TYPE, user_i
     return invite.invite_link
 
 
-async def send_invite_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_invite_instructions(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Foydalanuvchiga shaxsiy taklif havolasi va kerakli tugmalarni ko'rsatadi."""
     user = update.effective_user
     message = update.effective_message
     if not user or not message:
         return
+
     try:
         link = await ensure_personal_invite_link(context, user.id)
         count = invite_count(user.id)
-        await message.reply_text(
-            "👥 Guruhda yozish uchun 3 ta yangi odam taklif qiling.\n\n"
-            f"Sizning shaxsiy taklif havolangiz:\n{link}\n\n"
-            f"Hisoblangan a'zolar: {count}/{INVITE_TARGET}\n"
-            "Faqat shu havola orqali birinchi marta qo'shilgan yangi a'zolar hisoblanadi. "
-            "Taklif qilgan odamingiz guruhdan chiqsa, hisobdan ayriladi."
+        share_url = (
+            "https://t.me/share/url?url="
+            + quote(link, safe="")
+            + "&text="
+            + quote("Denov Avto Savdo guruhiga qo‘shiling!", safe="")
         )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 3 TA ODAM TAKLIF QILISH", url=share_url)],
+            [InlineKeyboardButton(
+                "✅ OBUNA VA TAKLIFLARNI TASDIQLASH",
+                callback_data=f"check_sub:{user.id}",
+            )],
+        ])
+        sent = await message.reply_text(
+            "👥 Guruhda yozish uchun kanalga obuna bo‘ling va 3 ta yangi odam taklif qiling.\n\n"
+            f"Hisobingiz: {count}/{INVITE_TARGET}\n"
+            f"Shaxsiy taklif havolangiz:\n{link}\n\n"
+            "Taklif qilgan odamingiz guruhdan chiqsa, hisobdan ayriladi. "
+            "3 ta odam qo‘shilgach, tasdiqlash tugmasini bosing.",
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        if message.chat.type in ("group", "supergroup"):
+            async def delete_invite_notice():
+                await asyncio.sleep(BOT_NOTICE_TTL)
+                try:
+                    await sent.delete()
+                except TelegramError:
+                    log.info("Vaqtinchalik /invite xabari o'chirilmadi")
+            asyncio.create_task(delete_invite_notice())
     except TelegramError:
         log.exception("Taklif havolasini yaratishda xato. user_id=%s", user.id)
         await message.reply_text(
@@ -276,13 +305,13 @@ async def send_subscription_prompt(
             [InlineKeyboardButton("✅ OBUNA VA TAKLIFLARNI TASDIQLASH", callback_data=f"check_sub:{user.id}")],
         ])
         await send_temporary_group_message(
-
+            context,
             text=(
-                f"📣 <b>Hurmatli {mention}!</b>\\n\\n"
-                "Guruhda yozish uchun kanalga obuna bo‘ling va 3 ta yangi odam taklif qiling.\\n\\n"
-                f"👥 Takliflar hisobingiz: <b>{count}/{INVITE_TARGET}</b>\\n"
+                f"📣 <b>Hurmatli {mention}!</b>\n\n"
+                "Guruhda yozish uchun kanalga obuna bo‘ling va 3 ta yangi odam taklif qiling.\n\n"
+                f"👥 Takliflar hisobingiz: <b>{count}/{INVITE_TARGET}</b>\n"
                 "«3 TA ODAM TAKLIF QILISH» tugmasini bosing va havolani ulashing. "
-                "So‘ng tasdiqlash tugmasini bosing.\\n\\n"
+                "So‘ng tasdiqlash tugmasini bosing.\n\n"
                 "<i>Ikkala shart bajarilgandan keyin guruhda yozishingiz mumkin.</i>"
             ),
             parse_mode="HTML",
@@ -339,7 +368,7 @@ async def check_subscription_button(
                 [InlineKeyboardButton("✅ QAYTA TEKSHIRISH", callback_data=f"check_sub:{target_user_id}")],
             ])
             await send_temporary_group_message(
-
+                context,
                 text=f"👥 Takliflar hisobingiz: {count}/{INVITE_TARGET}. Yana {INVITE_TARGET-count} ta yangi odam taklif qiling, so‘ng qayta tekshiring.",
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
@@ -409,11 +438,11 @@ async def moderate_group_message(
                     [InlineKeyboardButton("✅ TAKLIFLARNI TASDIQLASH", callback_data=f"check_sub:{user.id}")],
                 ])
                 await send_temporary_group_message(
-
+                    context,
                     text=(
-                        f"👥 Guruhda yozish uchun yana <b>{max(0, INVITE_TARGET - invited)} ta</b> yangi odam taklif qiling.\\n"
-                        f"Hisobingiz: <b>{invited}/{INVITE_TARGET}</b>\\n"
-                        "Taklif qilingan odam guruhdan chiqsa, hisobdan ayriladi.\\n"
+                        f"👥 Guruhda yozish uchun yana <b>{max(0, INVITE_TARGET - invited)} ta</b> yangi odam taklif qiling.\n"
+                        f"Hisobingiz: <b>{invited}/{INVITE_TARGET}</b>\n"
+                        "Taklif qilingan odam guruhdan chiqsa, hisobdan ayriladi.\n"
                         "3 ta odam qo‘shilgach, tasdiqlash tugmasini bosing."
                     ),
                     parse_mode="HTML",
