@@ -222,8 +222,7 @@ async def track_group_member(
         log.info("A'zo chiqdi, taklif hisobi ayrildi. user_id=%s", member.id)
 
 
-# GURUHDA BOT YUBORGAN BARCHA XABARLAR 60 SONIYADAN KEYIN O'CHIRILADI.
-# Bu muddat barcha foydalanuvchilar uchun bir xil; xabar bilan uning tugmalari ham yo'qoladi.
+# Bot yuborgan guruh xabarlari 1 daqiqadan keyin o'chiriladi.
 BOT_NOTICE_TTL = 60
 
 
@@ -231,7 +230,7 @@ async def send_temporary_group_message(
     context: ContextTypes.DEFAULT_TYPE,
     **kwargs,
 ):
-    """Guruhga bot xabarini yuboradi va 60 soniyadan keyin hamma uchun o'chiradi."""
+    """Bot xabarini yuboradi va 60 soniyadan keyin o'chirishni rejalashtiradi."""
     sent = await context.bot.send_message(chat_id=GROUP_ID, **kwargs)
 
     async def delete_later():
@@ -241,19 +240,16 @@ async def send_temporary_group_message(
                 chat_id=sent.chat_id,
                 message_id=sent.message_id,
             )
-            log.info(
-                "Bot xabari 60 soniyadan keyin o'chirildi. message_id=%s",
-                sent.message_id,
-            )
+            log.info("Bot xabari 60 soniyadan keyin o'chirildi: message_id=%s", sent.message_id)
         except TelegramError:
             log.exception(
-                "Bot xabarini o'chirish amalga oshmadi. "
-                "Bot adminligi va delete_messages huquqini tekshiring. message_id=%s",
+                "Bot xabarini o'chira olmadi. Botning guruhdagi delete_messages huquqini tekshiring. "
+                "message_id=%s",
                 sent.message_id,
             )
 
-    task = asyncio.create_task(delete_later())
-    context.application.create_task(task)
+    # Muhim: vazifani faqat bir marta Application orqali rejalashtiramiz.
+    context.application.create_task(delete_later())
     return sent
 
 
