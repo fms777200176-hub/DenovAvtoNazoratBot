@@ -347,9 +347,12 @@ async def notify_invite_progress(
         await send_temporary_group_message(
             context,
             text=(
-                f"Hurmatli {mention}, siz guruhga <b>{count} ta</b> odam qo‘shdingiz.\n"
-                f"Yana <b>{remaining} ta</b> odam qo‘shing.\n"
-                f"Hisobingiz: <b>{count}/{INVITE_TARGET}</b>"
+                f"👋 <b>Assalomu alaykum, hurmatli {mention}!</b>\n\n"
+                f"🚘 Guruhda erkin yozish va avtomobil e’lonlarini joylashtirish uchun "
+                f"yana <b>{remaining} nafar</b> yangi a’zo qo‘shing.\n\n"
+                f"👥 <b>Sizning natijangiz: {count}/{INVITE_TARGET}</b>\n"
+                "🎉 3 nafar a’zo qo‘shganingizdan so‘ng yozish huquqingiz avtomatik ochiladi.\n\n"
+                "🤝 Faolligingiz uchun rahmat!"
             ),
             parse_mode="HTML",
             disable_web_page_preview=True,
@@ -400,10 +403,10 @@ async def unlock_if_eligible(
                 context,
                 ttl=SUCCESS_NOTICE_TTL,
                 text=(
-                    f"🎉 <b>Tabriklaymiz!</b>\n\n"
-                    f"Hurmatli {mention}, siz guruhimizga <b>{count} ta</b> odam qo‘shdingiz!\n\n"
-                    "Endi bemalol guruhga yozishingiz va e’lon joylashingiz mumkin. 😊\n\n"
-                    "<i>Denov Avto Savdo jamoasi</i>"
+                    f"🎉 <b>Assalomu alaykum, hurmatli {mention}!</b>\n\n"
+                    f"Siz guruhimizga <b>{count} nafar</b> yangi a’zo qo‘shdingiz!\n\n"
+                    "✅ Endi guruhda bemalol yozishingiz va avtomobil e’lonlarini joylashtirishingiz mumkin.\n\n"
+                    "🤝 <i>Faolligingiz uchun rahmat! Denov Avto Savdo jamoasi.</i>"
                 ),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -530,11 +533,12 @@ async def moderate_group_message(
             await send_temporary_group_message(
                 context,
                 text=(
-                    f"👥 <b>Hurmatli {mention}!</b>\n\n"
-                    f"Guruhda yozish uchun yana <b>{max(0, INVITE_TARGET - invited)} ta</b> "
-                    "yangi odamni bevosita guruhga qo‘shing.\n"
-                    f"Hisobingiz: <b>{invited}/{INVITE_TARGET}</b>\n"
-                    "Odam qo‘shish uchun havola kerak emas."
+                    f"👋 <b>Assalomu alaykum, hurmatli {mention}!</b>\n\n"
+                    "🚘 Guruhda erkin yozish va avtomobil e’lonlarini joylashtirish uchun "
+                    f"yana <b>{max(0, INVITE_TARGET - invited)} nafar</b> yangi a’zo qo‘shing.\n\n"
+                    f"👥 <b>Sizning natijangiz: {invited}/{INVITE_TARGET}</b>\n"
+                    "🎉 3 nafar a’zo qo‘shganingizdan so‘ng yozish huquqingiz avtomatik ochiladi.\n\n"
+                    "🤝 Faolligingiz uchun rahmat!"
                 ),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
