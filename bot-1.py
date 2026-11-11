@@ -34,6 +34,8 @@ GROUP_ID = int(os.getenv("GROUP_ID", "-1003945847242"))
 # Bir foydalanuvchiga takroriy obuna xabari yuborish oralig'i
 NOTICE_COOLDOWN = 30
 INVITE_TARGET = 3
+# Bu ikki foydalanuvchi barcha obuna/taklif cheklovlaridan ozod.
+EXEMPT_USER_IDS = {6571641901, 5257275610}
 DB_PATH = os.getenv("DB_PATH", "denov_avto_nazorat.sqlite3")
 
 logging.basicConfig(
@@ -129,6 +131,12 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS permanent_unlocks (
                 user_id INTEGER PRIMARY KEY,
                 unlocked_at INTEGER NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS invite_progress (
+                user_id INTEGER PRIMARY KEY,
+                last_count INTEGER NOT NULL DEFAULT 0
             )
         """)
         # Migratsiya: eski bazada 3 ta amaldagi taklifi yoki oldingi
@@ -227,6 +235,22 @@ def mark_success_notice(user_id: int) -> None:
         )
 
 
+def last_notified_invite_count(user_id: int) -> int:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT last_count FROM invite_progress WHERE user_id=?", (user_id,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+
+def mark_invite_progress(user_id: int, count: int) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT OR REPLACE INTO invite_progress(user_id, last_count) VALUES(?, ?)",
+            (user_id, count),
+        )
+
+
 async def ensure_personal_invite_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
     link = get_invite_link(user_id)
     if link:
@@ -244,7 +268,7 @@ async def track_group_member(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Guruhga yangi odamni kim qo'shganini hisoblaydi; chiqsa hisobdan ayiradi."""
+    """Guruhga odamni bevosita qo'shgan a'zoni Telegram update orqali hisoblaydi."""
     change = update.chat_member
     if not change or change.chat.id != GROUP_ID:
         return
@@ -259,29 +283,17 @@ async def track_group_member(
     left = old_status in ACTIVE_STATUSES and new_status not in ACTIVE_STATUSES
 
     if joined:
-        inviter_id = None
-
-        # Agar shaxsiy taklif havolasi ishlatilgan bo'lsa, uning egasini aniqlaymiz.
-        if change.invite_link:
-            link = change.invite_link.invite_link
-            with sqlite3.connect(DB_PATH) as con:
-                row = con.execute(
-                    "SELECT user_id FROM invite_links WHERE invite_link=?", (link,)
-                ).fetchone()
-            if row:
-                inviter_id = int(row[0])
-
-        # Kontaktlardan bevosita guruhga qo'shilgan odam:
-        # Telegram update'dagi from_user — qo'shishni bajargan foydalanuvchi.
-        if inviter_id is None:
-            actor = change.from_user
-            if actor and actor.id != member.id and not actor.is_bot:
-                inviter_id = actor.id
-
-        if inviter_id is not None and inviter_id != member.id:
-            record_invite_join(inviter_id, member.id)
-            log.info("Yangi a'zo hisoblandi. inviter=%s invited=%s", inviter_id, member.id)
-            await unlock_if_eligible(context, inviter_id)
+        actor = change.from_user
+        # Faqat guruhga odamni o'zi bevosita qo'shgan foydalanuvchini sanaymiz.
+        # Hech qanday taklif havolasi foydalanuvchiga ko'rsatilmaydi.
+        if actor and actor.id != member.id and not actor.is_bot:
+            if actor.id in EXEMPT_USER_IDS:
+                return
+            record_invite_join(actor.id, member.id)
+            count = invite_count(actor.id)
+            log.info("Yangi a'zo hisoblandi. inviter=%s invited=%s count=%s", actor.id, member.id, count)
+            await notify_invite_progress(context, actor.id, count)
+            await unlock_if_eligible(context, actor.id)
 
     elif left:
         remove_invited_member(member.id)
@@ -314,31 +326,65 @@ async def send_temporary_group_message(
 SUCCESS_NOTICE_TTL = 5 * 60
 
 
+async def notify_invite_progress(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, count: int
+) -> None:
+    """Har bir yangi qo'shilgan odamdan keyin guruhga hisobni chiqaradi."""
+    if count <= last_notified_invite_count(user_id):
+        return
+    if count >= INVITE_TARGET:
+        # 3 taga yetganda unlock_if_eligible muvaffaqiyat xabarini yuboradi.
+        mark_invite_progress(user_id, count)
+        return
+
+    try:
+        member = await context.bot.get_chat_member(GROUP_ID, user_id)
+        mention = f'<a href="tg://user?id={user_id}">{user_display_name(member.user)}</a>'
+    except TelegramError:
+        mention = "Foydalanuvchi"
+    remaining = max(0, INVITE_TARGET - count)
+    try:
+        await send_temporary_group_message(
+            context,
+            text=(
+                f"Hurmatli {mention}, siz guruhga <b>{count} ta</b> odam qo‘shdingiz.\n"
+                f"Yana <b>{remaining} ta</b> odam qo‘shing.\n"
+                f"Hisobingiz: <b>{count}/{INVITE_TARGET}</b>"
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        mark_invite_progress(user_id, count)
+    except TelegramError:
+        log.exception("Taklif hisobini guruhga yuborib bo'lmadi. user_id=%s", user_id)
+
+
 async def unlock_if_eligible(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
 ) -> bool:
     """3 ta odam qo'shgan va kanalga obuna bo'lgan foydalanuvchini darhol ochadi."""
-    # 3 ta taklif bir marta bajarilishi bilan doimiy ruxsat qayd etiladi.
-    # Keyinchalik taklif qilinganlar chiqib ketsa ham bu qayd o'chmaydi.
+    if user_id in EXEMPT_USER_IDS:
+        try:
+            await restore_group_permissions(context, user_id)
+            return True
+        except TelegramError:
+            log.exception("Istisno foydalanuvchi ruxsatini tiklab bo'lmadi. user_id=%s", user_id)
+            return False
+
     if invite_count(user_id) >= INVITE_TARGET:
         grant_permanent_unlock(user_id)
-
-    # Avval doimiy ruxsat bor-yo'qligini tekshiramiz: bunday foydalanuvchidan
-    # qayta 3 ta odam qo'shish talab qilinmaydi. Kanal obunasi sharti saqlanadi.
     if not has_permanent_unlock(user_id):
         return False
     if not await is_subscribed(context, user_id):
         return False
 
     try:
-        # Telegramdagi haqiqiy guruh cheklovini ham darhol olib tashlaymiz.
         await restore_group_permissions(context, user_id)
     except TelegramError:
         log.exception("Yozish huquqini ochib bo'lmadi. user_id=%s", user_id)
         return False
 
-    # Takroriy chat_member/message hodisalari tabrikni qayta-qayta yubormasin.
     if not has_success_notice(user_id):
         try:
             member = await context.bot.get_chat_member(GROUP_ID, user_id)
@@ -348,14 +394,15 @@ async def unlock_if_eligible(
             log.exception("Foydalanuvchi ismini olishda xato. user_id=%s", user_id)
 
         mention = f'<a href="tg://user?id={user_id}">{name}</a>'
+        count = max(INVITE_TARGET, invite_count(user_id))
         try:
             await send_temporary_group_message(
                 context,
                 ttl=SUCCESS_NOTICE_TTL,
                 text=(
                     f"🎉 <b>Tabriklaymiz!</b>\n\n"
-                    f"Hurmatli {mention}, siz guruhimizga 3 ta odam qo‘shdingiz!\n\n"
-                    "Endi bemalol yozishingiz va e’lon joylashingiz mumkin. 😊\n\n"
+                    f"Hurmatli {mention}, siz guruhimizga <b>{count} ta</b> odam qo‘shdingiz!\n\n"
+                    "Endi bemalol guruhga yozishingiz va e’lon joylashingiz mumkin. 😊\n\n"
                     "<i>Denov Avto Savdo jamoasi</i>"
                 ),
                 parse_mode="HTML",
@@ -434,6 +481,14 @@ async def moderate_group_message(
     if not user or user.is_bot:
         return
 
+    # Maxsus ikki foydalanuvchi: oddiy a'zo, lekin bot cheklovlaridan ozod.
+    if user.id in EXEMPT_USER_IDS:
+        try:
+            await restore_group_permissions(context, user.id)
+        except TelegramError:
+            log.exception("Maxsus foydalanuvchi ruxsatini tiklab bo'lmadi. user_id=%s", user.id)
+        return
+
     # Buyruqlarni o'chirmaymiz (masalan /help).
     if message.text and message.text.startswith("/"):
         return
@@ -471,13 +526,15 @@ async def moderate_group_message(
     last_notice = context.application.bot_data.setdefault("last_notice", {})
     if now - last_notice.get(user.id, 0) >= NOTICE_COOLDOWN:
         try:
+            mention = f'<a href="tg://user?id={user.id}">{user_display_name(user)}</a>'
             await send_temporary_group_message(
                 context,
                 text=(
-                    f"👥 Guruhda yozish uchun yana <b>{max(0, INVITE_TARGET - invited)} ta</b> "
-                    "yangi odamni kontaktlaringizdan guruhga qo‘shing.\n"
+                    f"👥 <b>Hurmatli {mention}!</b>\n\n"
+                    f"Guruhda yozish uchun yana <b>{max(0, INVITE_TARGET - invited)} ta</b> "
+                    "yangi odamni bevosita guruhga qo‘shing.\n"
                     f"Hisobingiz: <b>{invited}/{INVITE_TARGET}</b>\n"
-                    "Siz qo‘shgan odam guruhdan chiqsa, hisobdan ayriladi."
+                    "Odam qo‘shish uchun havola kerak emas."
                 ),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -521,6 +578,9 @@ async def channel_membership_changed(
     user = change.new_chat_member.user
     if user.is_bot:
         return
+    if user.id in EXEMPT_USER_IDS:
+        await unlock_if_eligible(context, user.id)
+        return
 
     was_subscribed = change.old_chat_member.status in ACTIVE_STATUSES
     is_now_subscribed = change.new_chat_member.status in ACTIVE_STATUSES
@@ -549,6 +609,14 @@ async def post_init(application: Application) -> None:
             "Kanalga ulanib bo'lmadi. CHANNEL_ID/CHANNEL_URL va "
             "botning kanaldagi adminligini tekshiring."
         )
+
+    # Maxsus ikki foydalanuvchining ruxsati bot qayta ishga tushganda ham tiklanadi.
+    for exempt_user_id in EXEMPT_USER_IDS:
+        try:
+            await restore_group_permissions(application, exempt_user_id)
+            log.info("Maxsus foydalanuvchi uchun yozish huquqi tiklandi: %s", exempt_user_id)
+        except TelegramError:
+            log.exception("Maxsus foydalanuvchi ruxsatini tiklashda xato: %s", exempt_user_id)
 
 
 def main() -> None:
@@ -593,7 +661,7 @@ def main() -> None:
         )
     )
 
-    log.info("Denov Avto Nazorat Bot ishga tushmoqda... (3 taklif bir marta = doimiy ruxsat; tabrik 5 daqiqa; boshqa xabarlar 1 daqiqa)")
+    log.info("Denov Avto Nazorat Bot ishga tushmoqda... (bevosita 3 taklif = doimiy ruxsat; maxsus istisnolar faol; tabrik 5 daqiqa; boshqa xabarlar 1 daqiqa)")
     app.run_polling(
         allowed_updates=["message", "chat_member", "my_chat_member"],
         drop_pending_updates=True,
