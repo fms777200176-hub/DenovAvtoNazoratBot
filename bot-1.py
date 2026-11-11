@@ -14,7 +14,6 @@ from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     ChatMemberHandler,
     ContextTypes,
     MessageHandler,
@@ -119,9 +118,9 @@ def init_db() -> None:
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_inviter ON invite_joins(inviter_user_id)")
         con.execute("""
-            CREATE TABLE IF NOT EXISTS pending_confirmations (
+            CREATE TABLE IF NOT EXISTS success_notices (
                 user_id INTEGER PRIMARY KEY,
-                expires_at INTEGER NOT NULL
+                sent_at INTEGER NOT NULL
             )
         """)
 
@@ -163,30 +162,35 @@ def record_invite_join(inviter_id: int, invited_id: int) -> None:
 
 
 def remove_invited_member(invited_id: int) -> None:
-    # Tanlangan qoida: taklif qilingan a'zo chiqsa, uning hissasi hisobdan ayriladi.
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("DELETE FROM invite_joins WHERE invited_user_id=?", (invited_id,))
-
-
-def get_pending_confirmation(user_id: int):
+    # Taklif qilingan a'zo chiqsa, uning hissasi hisobdan ayriladi.
     with sqlite3.connect(DB_PATH) as con:
         row = con.execute(
-            "SELECT expires_at FROM pending_confirmations WHERE user_id=?", (user_id,)
+            "SELECT inviter_user_id FROM invite_joins WHERE invited_user_id=?",
+            (invited_id,),
         ).fetchone()
-        return int(row[0]) if row else None
+        con.execute("DELETE FROM invite_joins WHERE invited_user_id=?", (invited_id,))
+        inviter_id = int(row[0]) if row else None
+
+    # Takliflar soni 3 tadan kamaygan bo'lsa, keyingi safar tabrik qayta yuborilishi mumkin.
+    if inviter_id is not None and invite_count(inviter_id) < INVITE_TARGET:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("DELETE FROM success_notices WHERE user_id=?", (inviter_id,))
 
 
-def set_pending_confirmation(user_id: int, expires_at: int) -> None:
+def has_success_notice(user_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT 1 FROM success_notices WHERE user_id=?", (user_id,)
+        ).fetchone()
+        return row is not None
+
+
+def mark_success_notice(user_id: int) -> None:
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
-            "INSERT OR REPLACE INTO pending_confirmations(user_id, expires_at) VALUES(?, ?)",
-            (user_id, expires_at),
+            "INSERT OR REPLACE INTO success_notices(user_id, sent_at) VALUES(?, ?)",
+            (user_id, int(time.time())),
         )
-
-
-def clear_pending_confirmation(user_id: int) -> None:
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("DELETE FROM pending_confirmations WHERE user_id=?", (user_id,))
 
 
 async def ensure_personal_invite_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
@@ -243,8 +247,7 @@ async def track_group_member(
         if inviter_id is not None and inviter_id != member.id:
             record_invite_join(inviter_id, member.id)
             log.info("Yangi a'zo hisoblandi. inviter=%s invited=%s", inviter_id, member.id)
-            if invite_count(inviter_id) >= INVITE_TARGET and await is_subscribed(context, inviter_id):
-                await send_confirmation_prompt(context, inviter_id)
+            await unlock_if_eligible(context, inviter_id)
 
     elif left:
         remove_invited_member(member.id)
@@ -274,44 +277,55 @@ async def send_temporary_group_message(
     return sent
 
 
-CONFIRMATION_TTL = 5 * 60
+SUCCESS_NOTICE_TTL = 5 * 60
 
 
-async def send_confirmation_prompt(
+async def unlock_if_eligible(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
-) -> None:
-    """3 ta odam qo'shgan obunachiga 5 daqiqalik tasdiqlash xabarini yuboradi."""
-    if get_pending_confirmation(user_id) is not None:
-        return
-    if invite_count(user_id) < INVITE_TARGET or not await is_subscribed(context, user_id):
-        return
+) -> bool:
+    """3 ta odam qo'shgan va kanalga obuna bo'lgan foydalanuvchini darhol ochadi."""
+    if invite_count(user_id) < INVITE_TARGET:
+        return False
+    if not await is_subscribed(context, user_id):
+        return False
 
-    expires_at = int(time.time()) + CONFIRMATION_TTL
-    set_pending_confirmation(user_id, expires_at)
     try:
-        member = await context.bot.get_chat_member(GROUP_ID, user_id)
-        name = user_display_name(member.user)
-        mention = f'<a href="tg://user?id={user_id}">{name}</a>'
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ TASDIQLASH", callback_data=f"check_sub:{user_id}")]
-        ])
-        await send_temporary_group_message(
-            context,
-            ttl=CONFIRMATION_TTL,
-            text=(
-                f"🎉 {mention}, siz 3 ta yangi odam qo‘shdingiz!\n\n"
-                f"⚠️ <b>Bu tasdiqlash tugmasi faqat {mention} uchun.</b>\n"
-                "Yozish huquqini hoziroq ochish uchun tugmani bosing. "
-                "Bosmasangiz, 5 daqiqadan keyin yozish huquqingiz avtomatik ochiladi."
-            ),
-            parse_mode="HTML",
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
+        # Telegramdagi haqiqiy guruh cheklovini ham darhol olib tashlaymiz.
+        await restore_group_permissions(context, user_id)
     except TelegramError:
-        clear_pending_confirmation(user_id)
-        log.exception("Tasdiqlash xabarini yuborib bo'lmadi. user_id=%s", user_id)
+        log.exception("Yozish huquqini ochib bo'lmadi. user_id=%s", user_id)
+        return False
+
+    # Takroriy chat_member/message hodisalari tabrikni qayta-qayta yubormasin.
+    if not has_success_notice(user_id):
+        try:
+            member = await context.bot.get_chat_member(GROUP_ID, user_id)
+            name = user_display_name(member.user)
+        except TelegramError:
+            name = "Foydalanuvchi"
+            log.exception("Foydalanuvchi ismini olishda xato. user_id=%s", user_id)
+
+        mention = f'<a href="tg://user?id={user_id}">{name}</a>'
+        try:
+            await send_temporary_group_message(
+                context,
+                ttl=SUCCESS_NOTICE_TTL,
+                text=(
+                    f"🎉 <b>Tabriklaymiz!</b>\n\n"
+                    f"Hurmatli {mention}, siz guruhimizga 3 ta odam qo‘shdingiz!\n\n"
+                    "Endi bemalol yozishingiz va e’lon joylashingiz mumkin. 😊\n\n"
+                    "<i>Denov Avto Savdo jamoasi</i>"
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            mark_success_notice(user_id)
+        except TelegramError:
+            log.exception("Tabrik xabarini yuborib bo'lmadi. user_id=%s", user_id)
+
+    log.info("Yozish huquqi ochildi: user_id=%s", user_id)
+    return True
 
 
 # ---------------- OBUNA TUGMALARI ----------------
@@ -320,11 +334,7 @@ async def send_subscription_prompt(
     context: ContextTypes.DEFAULT_TYPE,
     user,
 ) -> None:
-    """
-    Guruhda obuna bo'lish xabarini yuboradi.
-    Telegram guruh xabarini faqat bitta odamga ko'rsatish imkonini bermaydi:
-    bu xabar guruh a'zolariga ko'rinadi, ammo tugma natijasi faqat bosgan odamga chiqadi.
-    """
+    """Kanalga obuna bo'lmagan foydalanuvchiga obuna havolasini ko'rsatadi."""
     now = time.monotonic()
     last_notice = context.application.bot_data.setdefault("last_notice", {})
     if now - last_notice.get(user.id, 0) < NOTICE_COOLDOWN:
@@ -332,22 +342,18 @@ async def send_subscription_prompt(
 
     name = user_display_name(user)
     mention = f'<a href="tg://user?id={user.id}">{name}</a>'
-
+    count = invite_count(user.id)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 DENOV AVTO SAVDO KANALIGA OBUNA BO‘LISH", url=CHANNEL_URL)]
+    ])
     try:
-        count = invite_count(user.id)
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 DENOV AVTO SAVDO KANALIGA OBUNA BO‘LISH", url=CHANNEL_URL)],
-            [InlineKeyboardButton("✅ OBUNA VA 3 TA ODAMNI TASDIQLASH", callback_data=f"check_sub:{user.id}")],
-        ])
         await send_temporary_group_message(
             context,
             text=(
                 f"📣 <b>Hurmatli {mention}!</b>\n\n"
-                "Guruhda yozish uchun kanalga obuna bo‘ling va kontaktlaringizdan 3 ta yangi odamni guruhga qo‘shing.\n\n"
-                f"👥 Qo‘shgan odamlaringiz hisobi: <b>{count}/{INVITE_TARGET}</b>\n"
-                ""
-                "So‘ng tasdiqlash tugmasini bosing.\n\n"
-                "<i>Ikkala shart bajarilgandan keyin guruhda yozishingiz mumkin.</i>"
+                "Guruhda yozish uchun avval kanalimizga obuna bo‘ling va kontaktlaringizdan "
+                f"{INVITE_TARGET} ta yangi odamni guruhga qo‘shing.\n\n"
+                f"👥 Qo‘shgan odamlaringiz: <b>{count}/{INVITE_TARGET}</b>"
             ),
             parse_mode="HTML",
             reply_markup=keyboard,
@@ -355,63 +361,7 @@ async def send_subscription_prompt(
         )
         last_notice[user.id] = now
     except TelegramError:
-        log.exception("Obuna/taklif xabarini yuborib bo'lmadi. user_id=%s", user.id)
-
-
-# ---------------- TASDIQLASH TUGMASI ----------------
-
-async def check_subscription_button(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    query = update.callback_query
-    if not query or not query.data:
-        return
-
-    try:
-        target_user_id = int(query.data.split(":", 1)[1])
-    except (IndexError, ValueError):
-        await query.answer("Tugma xato. Iltimos, yangi xabarni kuting.", show_alert=True)
-        return
-
-    # Boshqa odam birovning tugmasini bossa, obunani uning nomidan tekshirmaymiz.
-    if query.from_user.id != target_user_id:
-        await query.answer(
-            "Bu tugma boshqa foydalanuvchi uchun. O'zingiz yozganingizda chiqqan tugmani bosing.",
-            show_alert=True,
-        )
-        return
-
-    if await is_subscribed(context, target_user_id):
-        count = invite_count(target_user_id)
-        if count >= INVITE_TARGET:
-            name = user_display_name(query.from_user)
-            clear_pending_confirmation(target_user_id)
-            await query.answer(
-                f"🎉 Hurmatli {query.from_user.full_name}, barcha shartlar bajarildi. Endi guruhda yozishingiz mumkin!",
-                show_alert=True,
-            )
-            log.info("Kirish talablari bajarildi. user_id=%s name=%s", target_user_id, name)
-        else:
-            await query.answer(
-                f"✅ Kanal obunasi tasdiqlandi. Yana {INVITE_TARGET-count} ta yangi odamni kontaktlaringizdan guruhga qo‘shing.",
-                show_alert=True,
-            )
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ QAYTA TASDIQLASH", callback_data=f"check_sub:{target_user_id}")]
-            ])
-            await send_temporary_group_message(
-                context,
-                text=f"👥 Qo‘shgan odamlaringiz hisobi: {count}/{INVITE_TARGET}. Yana {INVITE_TARGET-count} ta yangi odamni kontaktlaringizdan guruhga qo‘shing, so‘ng qayta tekshiring.",
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-    else:
-        await query.answer(
-            "❌ Siz hali kanalga obuna bo‘lmagansiz. "
-            "Avval kanalga obuna bo‘ling, keyin yana tasdiqlang.",
-            show_alert=True,
-        )
+        log.exception("Obuna xabarini yuborib bo'lmadi. user_id=%s", user.id)
 
 
 # ---------------- GURUH XABARLARINI TEKSHIRISH ----------------
@@ -431,10 +381,7 @@ async def moderate_group_message(
         return
 
     user = update.effective_user
-    if not user:
-        return
-
-    if user.is_bot:
+    if not user or user.is_bot:
         return
 
     # Buyruqlarni o'chirmaymiz (masalan /help).
@@ -443,56 +390,43 @@ async def moderate_group_message(
 
     subscribed = await is_subscribed(context, user.id)
     invited = invite_count(user.id)
+
+    # Ikkala shart bajarilishi bilan huquq darhol ochiladi; tasdiqlash talab qilinmaydi.
     if subscribed and invited >= INVITE_TARGET:
-        expires_at = get_pending_confirmation(user.id)
-        if expires_at is None:
-            return
-        if int(time.time()) >= expires_at:
-            clear_pending_confirmation(user.id)
-            return
-        # 5 daqiqalik tasdiqlash oynasi tugamaguncha yoki tugma bosilmaguncha yozish yopiq.
-        try:
-            await message.delete()
-        except TelegramError:
-            log.exception("Tasdiqlash kutilayotgan xabarni o'chirib bo'lmadi. user_id=%s", user.id)
+        await unlock_if_eligible(context, user.id)
         return
 
-    # Talablardan biri bajarilmagan bo'lsa, oddiy foydalanuvchi xabarini o'chiramiz.
+    # Shartlardan biri bajarilmagan bo'lsa, foydalanuvchi xabarini o'chiramiz.
     try:
         await message.delete()
     except TelegramError:
         log.exception(
-            "Foydalanuvchi xabarini o'chirib bo'lmadi. "
-            "Bot adminmi va delete_messages huquqi bormi? user_id=%s",
+            "Foydalanuvchi xabarini o'chirib bo'lmadi. Bot adminmi va delete_messages huquqi bormi? user_id=%s",
             user.id,
         )
 
-    # Qaysi shart bajarilmaganini aniq ko'rsatamiz.
     if not subscribed:
         await send_subscription_prompt(context, user)
-    else:
-        now = time.monotonic()
-        last_notice = context.application.bot_data.setdefault("last_notice", {})
-        if now - last_notice.get(user.id, 0) >= NOTICE_COOLDOWN:
-            try:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ 3 TA ODAMNI TASDIQLASH", callback_data=f"check_sub:{user.id}")]
-                ])
-                await send_temporary_group_message(
-                    context,
-                    text=(
-                        f"👥 Guruhda yozish uchun yana <b>{max(0, INVITE_TARGET - invited)} ta</b> yangi odamni kontaktlaringizdan guruhga qo‘shing.\n"
-                        f"Hisobingiz: <b>{invited}/{INVITE_TARGET}</b>\n"
-                        "Siz qo‘shgan odam guruhdan chiqsa, hisobdan ayriladi.\n"
-                        "3 ta odam qo‘shilgach, tasdiqlash tugmasini bosing."
-                    ),
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
-                    disable_web_page_preview=True,
-                )
-                last_notice[user.id] = now
-            except TelegramError:
-                log.exception("Taklif eslatmasini yuborishda xato. user_id=%s", user.id)
+        return
+
+    now = time.monotonic()
+    last_notice = context.application.bot_data.setdefault("last_notice", {})
+    if now - last_notice.get(user.id, 0) >= NOTICE_COOLDOWN:
+        try:
+            await send_temporary_group_message(
+                context,
+                text=(
+                    f"👥 Guruhda yozish uchun yana <b>{max(0, INVITE_TARGET - invited)} ta</b> "
+                    "yangi odamni kontaktlaringizdan guruhga qo‘shing.\n"
+                    f"Hisobingiz: <b>{invited}/{INVITE_TARGET}</b>\n"
+                    "Siz qo‘shgan odam guruhdan chiqsa, hisobdan ayriladi."
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            last_notice[user.id] = now
+        except TelegramError:
+            log.exception("Taklif eslatmasini yuborishda xato. user_id=%s", user.id)
 
 
 async def clean_service_messages(
@@ -537,16 +471,11 @@ async def channel_membership_changed(
         return
 
     if is_now_subscribed:
-        try:
-            await restore_group_permissions(context, user.id)
-            log.info("Kanalga obuna bo'ldi. user_id=%s", user.id)
-            if invite_count(user.id) >= INVITE_TARGET:
-                await send_confirmation_prompt(context, user.id)
-        except TelegramError:
-            log.exception("Obuna bo'lganda ruxsatni tiklashda xato. user_id=%s", user.id)
+        log.info("Kanalga obuna bo'ldi. user_id=%s", user.id)
+        # Agar 3 ta odamni oldin qo'shgan bo'lsa, hoziroq yozish huquqini ochamiz.
+        await unlock_if_eligible(context, user.id)
     else:
-        # Guruh yozish joyini yopmaymiz. Obunadan chiqqan odam yozsa,
-        # uning xabari o'chiriladi va obuna tugmalari yuboriladi.
+        # Obunadan chiqqan odam yozsa, uning xabari moderatsiya tomonidan o'chiriladi.
         log.info("Kanal obunasidan chiqdi. user_id=%s", user.id)
 
 
@@ -581,9 +510,6 @@ def main() -> None:
         )
     )
 
-    # Tugmani bosgan odamning obunasini tekshiradi.
-    app.add_handler(CallbackQueryHandler(check_subscription_button, pattern=r"^check_sub:"))
-
     # Guruhga kim taklif havolasi bilan kirganini va kim chiqib ketganini kuzatadi.
     app.add_handler(
         ChatMemberHandler(track_group_member, ChatMemberHandler.CHAT_MEMBER),
@@ -609,9 +535,9 @@ def main() -> None:
         )
     )
 
-    log.info("Denov Avto Nazorat Bot ishga tushmoqda...")
+    log.info("Denov Avto Nazorat Bot ishga tushmoqda... (3 taklif = darhol ruxsat; tabrik 5 daqiqa; boshqa xabarlar 1 daqiqa)")
     app.run_polling(
-        allowed_updates=["message", "chat_member", "callback_query", "my_chat_member"],
+        allowed_updates=["message", "chat_member", "my_chat_member"],
         drop_pending_updates=True,
     )
 
