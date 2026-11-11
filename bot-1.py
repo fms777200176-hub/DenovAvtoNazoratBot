@@ -319,14 +319,16 @@ async def unlock_if_eligible(
     user_id: int,
 ) -> bool:
     """3 ta odam qo'shgan va kanalga obuna bo'lgan foydalanuvchini darhol ochadi."""
-    # Kanal obunasi saqlanishi shart. 3 ta taklif bir marta bajarilgach,
-    # permanent ruxsat bazada qoladi va taklifchilar chiqib ketsa ham bekor bo'lmaydi.
-    if not await is_subscribed(context, user_id):
-        return False
-
+    # 3 ta taklif bir marta bajarilishi bilan doimiy ruxsat qayd etiladi.
+    # Keyinchalik taklif qilinganlar chiqib ketsa ham bu qayd o'chmaydi.
     if invite_count(user_id) >= INVITE_TARGET:
         grant_permanent_unlock(user_id)
-    elif not has_permanent_unlock(user_id):
+
+    # Avval doimiy ruxsat bor-yo'qligini tekshiramiz: bunday foydalanuvchidan
+    # qayta 3 ta odam qo'shish talab qilinmaydi. Kanal obunasi sharti saqlanadi.
+    if not has_permanent_unlock(user_id):
+        return False
+    if not await is_subscribed(context, user_id):
         return False
 
     try:
@@ -382,18 +384,27 @@ async def send_subscription_prompt(
     name = user_display_name(user)
     mention = f'<a href="tg://user?id={user.id}">{name}</a>'
     count = invite_count(user.id)
+    already_unlocked = has_permanent_unlock(user.id)
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 DENOV AVTO SAVDO KANALIGA OBUNA BO‘LISH", url=CHANNEL_URL)]
     ])
+    if already_unlocked:
+        prompt_text = (
+            f"📣 <b>Hurmatli {mention}!</b>\n\n"
+            "Siz 3 ta odam qo‘shish shartini avval bajargansiz. Qayta odam qo‘shishingiz shart emas. "
+            "Guruhda yozish uchun kanalimizga obuna bo‘ling."
+        )
+    else:
+        prompt_text = (
+            f"📣 <b>Hurmatli {mention}!</b>\n\n"
+            "Guruhda yozish uchun avval kanalimizga obuna bo‘ling va kontaktlaringizdan "
+            f"{INVITE_TARGET} ta yangi odamni guruhga qo‘shing.\n\n"
+            f"👥 Qo‘shgan odamlaringiz: <b>{count}/{INVITE_TARGET}</b>"
+        )
     try:
         await send_temporary_group_message(
             context,
-            text=(
-                f"📣 <b>Hurmatli {mention}!</b>\n\n"
-                "Guruhda yozish uchun avval kanalimizga obuna bo‘ling va kontaktlaringizdan "
-                f"{INVITE_TARGET} ta yangi odamni guruhga qo‘shing.\n\n"
-                f"👥 Qo‘shgan odamlaringiz: <b>{count}/{INVITE_TARGET}</b>"
-            ),
+            text=prompt_text,
             parse_mode="HTML",
             reply_markup=keyboard,
             disable_web_page_preview=True,
@@ -427,12 +438,19 @@ async def moderate_group_message(
     if message.text and message.text.startswith("/"):
         return
 
-    subscribed = await is_subscribed(context, user.id)
     invited = invite_count(user.id)
+    permanently_unlocked = has_permanent_unlock(user.id)
 
-    # Bir marta 3 ta odam qo'shib ruxsat olganlar taklifchilar chiqib ketsa ham
-    # qayta 3 ta odam qo'shmaydi. Kanal obunasi esa hanuz talab qilinadi.
-    if subscribed and (invited >= INVITE_TARGET or has_permanent_unlock(user.id)):
+    # Hozirgi hisob 3 taga yetgan bo'lsa, avval doimiy qayd qilamiz.
+    if invited >= INVITE_TARGET and not permanently_unlocked:
+        grant_permanent_unlock(user.id)
+        permanently_unlocked = True
+
+    subscribed = await is_subscribed(context, user.id)
+
+    # Doimiy ruxsatli foydalanuvchiga qayta odam qo'shish sharti qo'yilmaydi.
+    # Kanal obunasi alohida shart sifatida qoladi.
+    if permanently_unlocked and subscribed:
         await unlock_if_eligible(context, user.id)
         return
 
