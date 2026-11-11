@@ -123,6 +123,26 @@ def init_db() -> None:
                 sent_at INTEGER NOT NULL
             )
         """)
+        # 3 ta odam qo'shish shartini bir marta bajargan foydalanuvchi
+        # keyinchalik taklif qilingan odamlar chiqib ketsa ham ruxsatini saqlaydi.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS permanent_unlocks (
+                user_id INTEGER PRIMARY KEY,
+                unlocked_at INTEGER NOT NULL
+            )
+        """)
+        # Migratsiya: eski bazada 3 ta amaldagi taklifi yoki oldingi
+        # muvaffaqiyat xabari qayd etilgan foydalanuvchilarni saqlab qolamiz.
+        con.execute("""
+            INSERT OR IGNORE INTO permanent_unlocks(user_id, unlocked_at)
+            SELECT inviter_user_id, ? FROM invite_joins
+            GROUP BY inviter_user_id
+            HAVING COUNT(*) >= ?
+        """, (int(time.time()), INVITE_TARGET))
+        con.execute("""
+            INSERT OR IGNORE INTO permanent_unlocks(user_id, unlocked_at)
+            SELECT user_id, sent_at FROM success_notices
+        """)
 
 
 def get_invite_link(user_id: int):
@@ -171,10 +191,24 @@ def remove_invited_member(invited_id: int) -> None:
         con.execute("DELETE FROM invite_joins WHERE invited_user_id=?", (invited_id,))
         inviter_id = int(row[0]) if row else None
 
-    # Takliflar soni 3 tadan kamaygan bo'lsa, keyingi safar tabrik qayta yuborilishi mumkin.
-    if inviter_id is not None and invite_count(inviter_id) < INVITE_TARGET:
-        with sqlite3.connect(DB_PATH) as con:
-            con.execute("DELETE FROM success_notices WHERE user_id=?", (inviter_id,))
+    # Taklif qilingan odam chiqib ketsa ham permanent_unlocks o'chirilmaydi.
+    # Bir marta 3 ta odam qo'shib ruxsat olgan foydalanuvchining huquqi saqlanadi.
+
+
+def has_permanent_unlock(user_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT 1 FROM permanent_unlocks WHERE user_id=?", (user_id,)
+        ).fetchone()
+        return row is not None
+
+
+def grant_permanent_unlock(user_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT OR IGNORE INTO permanent_unlocks(user_id, unlocked_at) VALUES(?, ?)",
+            (user_id, int(time.time())),
+        )
 
 
 def has_success_notice(user_id: int) -> bool:
@@ -285,9 +319,14 @@ async def unlock_if_eligible(
     user_id: int,
 ) -> bool:
     """3 ta odam qo'shgan va kanalga obuna bo'lgan foydalanuvchini darhol ochadi."""
-    if invite_count(user_id) < INVITE_TARGET:
-        return False
+    # Kanal obunasi saqlanishi shart. 3 ta taklif bir marta bajarilgach,
+    # permanent ruxsat bazada qoladi va taklifchilar chiqib ketsa ham bekor bo'lmaydi.
     if not await is_subscribed(context, user_id):
+        return False
+
+    if invite_count(user_id) >= INVITE_TARGET:
+        grant_permanent_unlock(user_id)
+    elif not has_permanent_unlock(user_id):
         return False
 
     try:
@@ -391,8 +430,9 @@ async def moderate_group_message(
     subscribed = await is_subscribed(context, user.id)
     invited = invite_count(user.id)
 
-    # Ikkala shart bajarilishi bilan huquq darhol ochiladi; tasdiqlash talab qilinmaydi.
-    if subscribed and invited >= INVITE_TARGET:
+    # Bir marta 3 ta odam qo'shib ruxsat olganlar taklifchilar chiqib ketsa ham
+    # qayta 3 ta odam qo'shmaydi. Kanal obunasi esa hanuz talab qilinadi.
+    if subscribed and (invited >= INVITE_TARGET or has_permanent_unlock(user.id)):
         await unlock_if_eligible(context, user.id)
         return
 
@@ -535,7 +575,7 @@ def main() -> None:
         )
     )
 
-    log.info("Denov Avto Nazorat Bot ishga tushmoqda... (3 taklif = darhol ruxsat; tabrik 5 daqiqa; boshqa xabarlar 1 daqiqa)")
+    log.info("Denov Avto Nazorat Bot ishga tushmoqda... (3 taklif bir marta = doimiy ruxsat; tabrik 5 daqiqa; boshqa xabarlar 1 daqiqa)")
     app.run_polling(
         allowed_updates=["message", "chat_member", "my_chat_member"],
         drop_pending_updates=True,
